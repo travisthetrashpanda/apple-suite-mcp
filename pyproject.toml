@@ -1,0 +1,9 @@
+[project]
+name = "apple-mcp"
+version = "0.2.0"
+description = "MCP server for Apple Mail, Contacts, Calendar, Notes, and Reminders on macOS"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.2.0",
+    "pyobjc-framework-EventKit>=10.0",
+]
