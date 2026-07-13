@@ -84,6 +84,28 @@ cd ~/apple-suite-mcp && uv run python server.py check
 >
 > find my note about the wifi setup
 
+## Scoping access (optional)
+
+macOS permissions are per-*app*, not per-account — once the host app can
+control Mail, it can see every account on the Mac. If you want tighter
+control (say, a shared work/personal machine), copy `config.example.json`
+to `config.json` and list what the server is allowed to see:
+
+```json
+{
+  "mail_accounts": ["Personal"],
+  "calendars": ["Home", "Family"],
+  "reminder_lists": ["Reminders"],
+  "note_folders": ["Notes"],
+  "disabled_tools": ["mail_send"]
+}
+```
+
+Anything not listed is invisible to every tool — it can't be listed, read,
+searched, or modified. Omit a key (or the whole file) to allow everything
+of that kind. `disabled_tools` removes tools entirely (they're never even
+registered with the MCP client). `check_access` reports the active scoping.
+
 ## Tools
 
 | App | Tools |

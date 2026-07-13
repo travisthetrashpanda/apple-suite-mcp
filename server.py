@@ -32,6 +32,61 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("apple-suite")
 
+# ---------------------------------------------------------------------------
+# Optional scoping config. macOS permissions are per-app, not per-account —
+# this allowlist is how you stop the server from seeing accounts, calendars,
+# lists, or folders you haven't named. Missing file or empty list = allow
+# everything. See config.example.json.
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_KINDS = ("mail_accounts", "calendars", "reminder_lists", "note_folders")
+
+
+def load_config() -> dict:
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    with open(CONFIG_PATH) as f:
+        try:
+            cfg = json.load(f)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"config.json is not valid JSON: {e}")
+    if not isinstance(cfg, dict):
+        raise RuntimeError("config.json must contain a JSON object")
+    unknown = set(cfg) - set(CONFIG_KINDS) - {"disabled_tools"}
+    if unknown:
+        raise RuntimeError(f"config.json has unknown keys: {sorted(unknown)}")
+    return cfg
+
+
+CONFIG = load_config()
+
+
+def allowed(kind: str, name: str | None) -> bool:
+    wanted = {v.lower() for v in (CONFIG.get(kind) or [])}
+    return not wanted or (name or "").lower() in wanted
+
+
+def require_allowed(kind: str, name: str | None):
+    if not allowed(kind, name):
+        raise ValueError(
+            f"'{name}' is not in the {kind} allowlist (config.json) — "
+            "it is invisible to this server"
+        )
+
+
+def scoped(kind: str) -> bool:
+    return bool(CONFIG.get(kind))
+
+
+def tool(fn):
+    """Register an MCP tool unless config.json disables it by name."""
+    disabled = {t.lower() for t in (CONFIG.get("disabled_tools") or [])}
+    if fn.__name__.lower() in disabled:
+        return fn
+    return mcp.tool()(fn)
+
+
 # Large mailboxes (tens of thousands of messages) can take ~30s per
 # scripting call; AppleScript blocks carry their own 600s timeout.
 OSA_TIMEOUT = 630
@@ -297,6 +352,8 @@ def _mailbox_map(conn) -> list[dict]:
 def _mailbox_rowids(conn, account: str | None, mailbox: str | None) -> list[int]:
     ids = []
     for m in _mailbox_map(conn):
+        if not allowed("mail_accounts", m["account"]):
+            continue
         if account and (m["account"] or "").lower() != account.lower():
             continue
         if mailbox and mailbox != "*":
@@ -393,7 +450,7 @@ def fast_mail_search(account, query, field, mailbox, limit):
 # Mail tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool
 def mail_accounts() -> list[dict]:
     """List every account configured in Apple Mail (iCloud, Gmail, Google
     Workspace, etc.) with its email addresses and mailbox (folder) names."""
@@ -410,10 +467,11 @@ JSON.stringify(Mail.accounts().map(a => {
   };
 }));
 """
-    return run_jxa_json(script)
+    return [a for a in run_jxa_json(script)
+            if allowed("mail_accounts", a["name"])]
 
 
-@mcp.tool()
+@tool
 def mail_unread_counts() -> list[dict]:
     """Get the unread message count for each account's inbox, plus the
     combined total. Fast — use this before pulling message lists."""
@@ -428,15 +486,21 @@ for (const a of Mail.accounts()) {
 out.push({account: "ALL_INBOXES", unread: Mail.inbox.unreadCount()});
 JSON.stringify(out);
 """
-    return run_jxa_json(script)
+    rows = run_jxa_json(script)
+    if scoped("mail_accounts"):
+        # The combined-inbox total can't be filtered per account; drop it.
+        rows = [r for r in rows if r["account"] != "ALL_INBOXES"
+                and allowed("mail_accounts", r["account"])]
+    return rows
 
 
-@mcp.tool()
+@tool
 def mail_messages(account: str, mailbox: str = "INBOX", limit: int = 20,
                   unread_only: bool = False) -> list[dict]:
     """List recent messages in a mailbox, newest first. Returns id, subject,
     sender, date, and read status. Uses the fast local-index path when Full
     Disk Access is granted; otherwise AppleScript (large mailboxes ~30s)."""
+    require_allowed("mail_accounts", account)
     limit = max(1, min(int(limit), 100))
     fast = fast_mail_messages(account, mailbox, limit, unread_only)
     if fast is not None:
@@ -445,7 +509,7 @@ def mail_messages(account: str, mailbox: str = "INBOX", limit: int = 20,
     return _rows_from_script(_mail_batch_script(account, mailbox, limit, whose))
 
 
-@mcp.tool()
+@tool
 def mail_search(account: str = None, query: str = "", field: str = "subject",
                 mailbox: str = "INBOX", limit: int = 20) -> list[dict]:
     """Search messages whose subject or sender contains the query
@@ -456,6 +520,8 @@ def mail_search(account: str = None, query: str = "", field: str = "subject",
         raise ValueError('field must be "subject" or "sender"')
     if not query:
         raise ValueError("query must not be empty")
+    if account is not None:
+        require_allowed("mail_accounts", account)
     limit = max(1, min(int(limit), 100))
     fast = fast_mail_search(account, query, field, mailbox, limit)
     if fast is not None:
@@ -476,11 +542,12 @@ def mail_search(account: str = None, query: str = "", field: str = "subject",
     return _rows_from_script(_mail_batch_script(account, mailbox, limit, whose))
 
 
-@mcp.tool()
+@tool
 def mail_read_message(account: str, message_id: int, mailbox: str = "INBOX",
                       max_chars: int = 20000) -> dict:
     """Read the full content of one message by the id returned from
     mail_messages / mail_search."""
+    require_allowed("mail_accounts", account)
     script = f"""
 {AS_HANDLERS}
 set FS to character id 31
@@ -512,7 +579,7 @@ end timeout
     return out
 
 
-@mcp.tool()
+@tool
 def mail_send(to: list[str], subject: str, body: str, cc: list[str] = None,
               from_account_email: str = None) -> str:
     """Send an email through Apple Mail. from_account_email selects which
@@ -520,14 +587,25 @@ def mail_send(to: list[str], subject: str, body: str, cc: list[str] = None,
     the default. Always confirm with the user before sending."""
     if not to:
         raise ValueError("'to' must contain at least one recipient address")
+    if scoped("mail_accounts") and not from_account_email:
+        raise ValueError(
+            "A mail_accounts allowlist is active, so from_account_email is "
+            "required (the default account might not be allowed)"
+        )
     sender_line = ""
     if from_account_email:
-        known = [e for a in _account_identities() for e in a["emails"]]
-        if from_account_email.lower() not in {e.lower() for e in known}:
+        idents = _account_identities()
+        owner = next((a["name"] for a in idents
+                      if from_account_email.lower()
+                      in {e.lower() for e in a["emails"]}), None)
+        if owner is None:
+            known = [e for a in idents for e in a["emails"]
+                     if allowed("mail_accounts", a["name"])]
             raise ValueError(
                 f"'{from_account_email}' doesn't match any Mail account "
                 f"address. Known addresses: {', '.join(sorted(known))}"
             )
+        require_allowed("mail_accounts", owner)
         sender_line = f'    set sender of msg to "{as_quote(from_account_email)}"'
     recip_lines = "\n".join(
         f'        make new to recipient at end of to recipients with properties {{address:"{as_quote(a)}"}}'
@@ -577,6 +655,7 @@ return outText
 
 
 def _run_triage(account, mailbox, message_ids, action) -> dict:
+    require_allowed("mail_accounts", account)
     if not message_ids:
         raise ValueError("message_ids must not be empty")
     if len(message_ids) > TRIAGE_BATCH_LIMIT:
@@ -587,7 +666,7 @@ def _run_triage(account, mailbox, message_ids, action) -> dict:
     return {"updated": touched, "not_found": missing}
 
 
-@mcp.tool()
+@tool
 def mail_mark_read(account: str, message_ids: list[int],
                    mailbox: str = "INBOX", read: bool = True) -> dict:
     """Mark messages read (or unread with read=false) by id, in one batch
@@ -597,7 +676,7 @@ def mail_mark_read(account: str, message_ids: list[int],
     return _run_triage(account, mailbox, message_ids, action)
 
 
-@mcp.tool()
+@tool
 def mail_move(account: str, message_ids: list[int], to_mailbox: str,
               mailbox: str = "INBOX") -> dict:
     """Move messages by id from one mailbox to another within the same
@@ -607,7 +686,7 @@ def mail_move(account: str, message_ids: list[int], to_mailbox: str,
     return _run_triage(account, mailbox, message_ids, action)
 
 
-@mcp.tool()
+@tool
 def mail_trash(account: str, message_ids: list[int],
                mailbox: str = "INBOX") -> dict:
     """Move messages to the account's Trash by id, in one batch (max 50).
@@ -620,7 +699,7 @@ def mail_trash(account: str, message_ids: list[int],
 # Contacts
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool
 def contacts_search(query: str, limit: int = 10) -> list[dict]:
     """Search Contacts by name, organization, email, or phone (substring,
     case-insensitive). Returns full contact details."""
@@ -736,7 +815,7 @@ def iso(nsd) -> str | None:
     return datetime.fromtimestamp(nsd.timeIntervalSince1970()).isoformat(timespec="minutes")
 
 
-@mcp.tool()
+@tool
 def calendar_list() -> list[dict]:
     """List all calendars with their account/source and whether events can
     be added to them."""
@@ -747,24 +826,29 @@ def calendar_list() -> list[dict]:
         "title": c.title(),
         "source": c.source().title() if c.source() else None,
         "writable": bool(c.allowsContentModifications()),
-    } for c in cals]
+    } for c in cals if allowed("calendars", c.title())]
 
 
-@mcp.tool()
+@tool
 def calendar_events(start: str, end: str, calendars: list[str] = None) -> list[dict]:
     """List events between two ISO dates/datetimes (e.g. "2026-07-12" or
     "2026-07-12T09:00"). Optionally restrict to specific calendar titles.
     End date is exclusive-ish: use the day after the last day you want."""
     import EventKit
     store = ensure_full_access("event")
-    all_cals = store.calendarsForEntityType_(EventKit.EKEntityTypeEvent)
+    all_cals = [c for c in store.calendarsForEntityType_(EventKit.EKEntityTypeEvent)
+                if allowed("calendars", c.title())]
     cal_filter = None
     if calendars:
+        for name in calendars:
+            require_allowed("calendars", name)
         wanted = {c.lower() for c in calendars}
         cal_filter = [c for c in all_cals if c.title().lower() in wanted]
         if not cal_filter:
             raise ValueError(f"No calendars match {calendars}. "
                              f"Available: {[c.title() for c in all_cals]}")
+    elif scoped("calendars"):
+        cal_filter = all_cals
     pred = store.predicateForEventsWithStartDate_endDate_calendars_(
         nsdate(parse_dt(start, "start")),
         nsdate(parse_dt(end, "end")),
@@ -784,7 +868,7 @@ def calendar_events(start: str, end: str, calendars: list[str] = None) -> list[d
     } for e in events]
 
 
-@mcp.tool()
+@tool
 def calendar_create_event(title: str, start: str, end: str,
                           calendar: str = None, location: str = None,
                           notes: str = None, all_day: bool = False) -> dict:
@@ -796,6 +880,7 @@ def calendar_create_event(title: str, start: str, end: str,
     # Creating works even under write-only access, so don't demand full.
     target = None
     if calendar:
+        require_allowed("calendars", calendar)
         cals = store.calendarsForEntityType_(EventKit.EKEntityTypeEvent)
         for c in cals:
             if c.title().lower() == calendar.lower() and c.allowsContentModifications():
@@ -808,6 +893,8 @@ def calendar_create_event(title: str, start: str, end: str,
             )
     else:
         target = store.defaultCalendarForNewEvents()
+        if target is not None:
+            require_allowed("calendars", target.title())
     ev = EventKit.EKEvent.eventWithEventStore_(store)
     ev.setTitle_(title)
     ev.setStartDate_(nsdate(parse_dt(start, "start")))
@@ -851,14 +938,16 @@ def _due_iso(r):
     return iso(d) if d else None
 
 
-@mcp.tool()
+@tool
 def reminders_list(list_name: str = None, include_completed: bool = False) -> list[dict]:
     """List reminders, open ones by default. Optionally filter to one list
     (e.g. "Family"). Returns id, title, due date, notes, and list."""
     import EventKit
     store = ensure_full_access("reminder")
-    cals = store.calendarsForEntityType_(EventKit.EKEntityTypeReminder)
+    cals = [c for c in store.calendarsForEntityType_(EventKit.EKEntityTypeReminder)
+            if allowed("reminder_lists", c.title())]
     if list_name:
+        require_allowed("reminder_lists", list_name)
         cals = [c for c in cals if c.title().lower() == list_name.lower()]
         if not cals:
             raise ValueError(f"No reminder list named '{list_name}'")
@@ -882,7 +971,7 @@ def reminders_list(list_name: str = None, include_completed: bool = False) -> li
     return out
 
 
-@mcp.tool()
+@tool
 def reminders_create(title: str, list_name: str = None, due: str = None,
                      notes: str = None) -> dict:
     """Create a reminder. due is an ISO date or datetime (e.g. "2026-07-15"
@@ -892,11 +981,14 @@ def reminders_create(title: str, list_name: str = None, due: str = None,
     store = ensure_full_access("reminder")
     target = store.defaultCalendarForNewReminders()
     if list_name:
+        require_allowed("reminder_lists", list_name)
         cals = store.calendarsForEntityType_(EventKit.EKEntityTypeReminder)
         matches = [c for c in cals if c.title().lower() == list_name.lower()]
         if not matches:
             raise ValueError(f"No reminder list named '{list_name}'")
         target = matches[0]
+    elif target is not None:
+        require_allowed("reminder_lists", target.title())
     r = EventKit.EKReminder.reminderWithEventStore_(store)
     r.setTitle_(title)
     r.setCalendar_(target)
@@ -924,7 +1016,7 @@ def reminders_create(title: str, list_name: str = None, due: str = None,
             "id": r.calendarItemIdentifier()}
 
 
-@mcp.tool()
+@tool
 def reminders_complete(reminder_id: str) -> dict:
     """Mark a reminder complete by the id returned from reminders_list."""
     import EventKit
@@ -935,6 +1027,8 @@ def reminders_complete(reminder_id: str) -> dict:
     if not item.isKindOfClass_(EventKit.EKReminder):
         raise ValueError(f"Id {reminder_id} is not a reminder (it may be a "
                          "calendar event id)")
+    if item.calendar() is not None:
+        require_allowed("reminder_lists", item.calendar().title())
     item.setCompleted_(True)
     ok, err = store.saveReminder_commit_error_(item, True, None)
     if not ok:
@@ -946,7 +1040,7 @@ def reminders_complete(reminder_id: str) -> dict:
 # Notes
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool
 def notes_folders() -> list[dict]:
     """List Notes folders with note counts, per account."""
     script = """
@@ -959,10 +1053,11 @@ for (const acct of N.accounts()) {
 }
 JSON.stringify(out);
 """
-    return run_jxa_json(script)
+    return [f for f in run_jxa_json(script)
+            if allowed("note_folders", f["folder"])]
 
 
-@mcp.tool()
+@tool
 def notes_search(query: str, search_body: bool = True, limit: int = 10) -> list[dict]:
     """Search notes by title (and body text unless search_body is false).
     Returns id, title, folder, modification date, and a snippet."""
@@ -970,13 +1065,16 @@ def notes_search(query: str, search_body: bool = True, limit: int = 10) -> list[
         '{_or: [{name: {_contains: q}}, {plaintext: {_contains: q}}]}'
         if search_body else '{name: {_contains: q}}'
     )
+    # Folder scoping can't run inside the whose-query, so over-fetch and
+    # filter the results afterwards.
+    fetch = int(limit) if not scoped("note_folders") else min(int(limit) * 5, 100)
     script = f"""
 const N = Application("Notes");
 const q = {js(query)};
 const matches = N.notes.whose({clause});
 const cnt = matches.length;
 const out = [];
-for (let i = 0; i < Math.min(cnt, {int(limit)}); i++) {{
+for (let i = 0; i < Math.min(cnt, {fetch}); i++) {{
   const nt = matches[i];
   let folder = null;
   try {{ folder = nt.container().name(); }} catch (e) {{}}
@@ -990,10 +1088,15 @@ for (let i = 0; i < Math.min(cnt, {int(limit)}); i++) {{
 }}
 JSON.stringify({{total: cnt, results: out}});
 """
-    return run_jxa_json(script)
+    result = run_jxa_json(script)
+    if scoped("note_folders"):
+        result["results"] = [r for r in result["results"]
+                             if allowed("note_folders", r["folder"])][:int(limit)]
+        result["total"] = len(result["results"])
+    return result
 
 
-@mcp.tool()
+@tool
 def notes_read(note_id: str = None, title: str = None, max_chars: int = 30000) -> dict:
     """Read a note's full text by id (from notes_search) or exact title."""
     if not note_id and not title:
@@ -1005,9 +1108,12 @@ const N = Application("Notes");
 let out;
 try {{
   const nt = {getter};
+  let folder = null;
+  try {{ folder = nt.container().name(); }} catch (e) {{}}
   out = {{
     id: nt.id(),
     title: nt.name(),
+    folder: folder,
     modified: nt.modificationDate().toISOString(),
     text: (nt.plaintext() || "").slice(0, {int(max_chars)}),
   }};
@@ -1020,14 +1126,22 @@ JSON.stringify(out);
     if result.get("error") == "not_found":
         raise ValueError(f"No note found with "
                          f"{'id ' + note_id if note_id else 'title ' + repr(title)}")
+    require_allowed("note_folders", result.get("folder"))
     return result
 
 
-@mcp.tool()
+@tool
 def notes_create(title: str, body: str, folder: str = None) -> dict:
     """Create a note. body is plain text (line breaks preserved). folder is
     a folder name from notes_folders; omit for the default Notes folder."""
     import html
+    if folder:
+        require_allowed("note_folders", folder)
+    elif scoped("note_folders"):
+        raise ValueError(
+            "A note_folders allowlist is active, so 'folder' is required "
+            "(the default folder might not be allowed)"
+        )
     body_html = "<div>" + html.escape(body).replace("\n", "<br>") + "</div>"
     target = (f"N.folders.byName({js(folder)})" if folder else "N.defaultAccount()")
     script = f"""
@@ -1053,7 +1167,7 @@ FIXES = {
 }
 
 
-@mcp.tool()
+@tool
 def check_access() -> dict:
     """Diagnose every permission this server needs: Automation (Mail,
     Contacts, Notes), Calendar/Reminders access level, and Full Disk Access
@@ -1099,6 +1213,11 @@ def check_access() -> dict:
         report["full_disk_access"] = ("no access — mail queries fall back "
                                       "to AppleScript (slow on large mailboxes)")
         fixes.append(FIXES["full_disk"])
+
+    if CONFIG:
+        report["scoping"] = {k: CONFIG[k] for k in CONFIG}
+    else:
+        report["scoping"] = "none — every account/calendar/list/folder on this Mac is visible"
 
     report["fixes_needed"] = sorted(set(fixes)) if fixes else []
     report["ok"] = not fixes

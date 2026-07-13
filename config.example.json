@@ -1,0 +1,7 @@
+{
+  "mail_accounts": ["Personal"],
+  "calendars": ["Home", "Family"],
+  "reminder_lists": ["Reminders"],
+  "note_folders": ["Notes"],
+  "disabled_tools": ["mail_send"]
+}
