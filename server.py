@@ -298,6 +298,9 @@ def mail_db():
             # used Apple's 2001 epoch. A recent timestamp disambiguates.
             _db_state["epoch"] = 0 if mx > 1.4e9 else 978307200
             _db_state["cols"] = cols
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            _db_state["has_labels"] = "labels" in tables
             _db_state["conn"] = conn
             return conn
         except Exception:
@@ -311,7 +314,7 @@ const Mail = Application("Mail");
 JSON.stringify(Mail.accounts().map(a => {
   let user = null;
   try { user = a.userName(); } catch (e) {}
-  return {name: a.name(), emails: a.emailAddresses() || [], user: user};
+  return {name: a.name(), id: a.id(), emails: a.emailAddresses() || [], user: user};
 }));
 """
     return run_jxa_json(script)
@@ -327,15 +330,18 @@ def _mailbox_map(conn) -> list[dict]:
         keys = {e.lower() for e in a["emails"]}
         if a.get("user"):
             keys.add(a["user"].lower())
-        idents.append((a["name"], keys))
+        idents.append((a["name"], (a.get("id") or "").lower(), keys))
     out = []
     for row in conn.execute("SELECT ROWID, url FROM mailboxes"):
         url = row["url"] or ""
         parsed = urllib.parse.urlparse(url)
+        # Modern macOS uses the account UUID as the URL host
+        # (imap://UUID/INBOX); older versions embedded user@host.
+        host = (parsed.hostname or "").lower()
         user = urllib.parse.unquote(parsed.username or "").lower()
         account = None
-        for name, keys in idents:
-            if user and user in keys:
+        for name, aid, keys in idents:
+            if (aid and host == aid) or (user and user in keys):
                 account = name
                 break
         segs = [urllib.parse.unquote(s) for s in parsed.path.split("/") if s]
@@ -398,6 +404,18 @@ def _fast_query(conn, where: str, params: list, limit: int) -> list[dict]:
     return rows
 
 
+def _mbx_where(rowids: list[int]) -> tuple[str, list]:
+    """WHERE fragment matching messages in the given mailboxes. Gmail
+    accounts store each message once (under [Gmail]/All Mail) and record
+    INBOX/folder membership in the labels table, so match either way."""
+    ph = ",".join("?" * len(rowids))
+    if _db_state.get("has_labels"):
+        return (f"(m.mailbox IN ({ph}) OR m.ROWID IN "
+                f"(SELECT message_id FROM labels WHERE mailbox_id IN ({ph})))",
+                list(rowids) + list(rowids))
+    return f"m.mailbox IN ({ph})", list(rowids)
+
+
 def _like(q: str) -> str:
     escaped = q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
     return f"%{escaped}%"
@@ -413,8 +431,7 @@ def fast_mail_messages(account, mailbox, limit, unread_only):
             rowids = _mailbox_rowids(conn, account, mailbox)
             if not rowids:
                 return None
-            where = f"m.mailbox IN ({','.join('?' * len(rowids))})"
-            params = list(rowids)
+            where, params = _mbx_where(rowids)
             if unread_only:
                 cols = _db_state["cols"]
                 where += " AND " + ("m.read = 0" if "read" in cols else "(m.flags & 1) = 0")
@@ -433,8 +450,7 @@ def fast_mail_search(account, query, field, mailbox, limit):
             rowids = _mailbox_rowids(conn, account, mailbox)
             if not rowids:
                 return None
-            where = f"m.mailbox IN ({','.join('?' * len(rowids))})"
-            params: list = list(rowids)
+            where, params = _mbx_where(rowids)
             if field == "subject":
                 where += r" AND s.subject LIKE ? ESCAPE '\'"
                 params.append(_like(query))
