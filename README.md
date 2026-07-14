@@ -5,12 +5,19 @@ built-in Apple apps on your Mac: **Mail, Contacts, Calendar, Notes, and
 Reminders.**
 
 Because it talks to the Mail *app* rather than any one email service, it sees
-every account you've added to Mail — iCloud, Gmail, Google Workspace,
-Exchange — with no OAuth setup and no extra logins.
+every account you've added to Mail — iCloud plus any number of Gmail, Google
+Workspace, and Exchange accounts side by side — with no OAuth setup and no
+extra logins.
 
 ## Why this one
 
-There are several Apple MCPs out there. This one optimizes for three things:
+There are several Apple MCPs out there. This one optimizes for four things:
+
+- **Multi-account by nature.** Google-API MCPs authenticate one account per
+  OAuth grant — five Google accounts means five connector setups and five
+  token refreshes. This server gets every account at once (five Gmails, an
+  iCloud, an Exchange — whatever Mail and Calendar are signed into),
+  because your Mac already did the logging in.
 
 - **Minimal.** One readable `server.py`, three dependencies, no Node, no app
   to install. If you want to know what it does, you can just read it.
