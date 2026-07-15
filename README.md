@@ -34,6 +34,21 @@ There are several Apple MCPs out there. This one optimizes for four things:
 
 ## Setup
 
+### Easy mode — let your AI install it
+
+If you use Claude Code (or any coding agent), paste this and let it drive:
+
+> Read https://github.com/travisthetrashpanda/apple-suite-mcp and install it
+> for me: clone it, register it with my MCP client, then run its `check`
+> command and walk me through fixing any macOS permissions it reports
+> missing.
+
+The agent handles cloning and registration, and `check` tells it exactly
+which System Settings pane to point you at; you just click Allow when macOS
+asks. (Sensible to read what you're installing first — it's one Python file.)
+
+### Manual mode
+
 Requires macOS and [uv](https://docs.astral.sh/uv/) (`brew install uv`).
 
 ```sh
