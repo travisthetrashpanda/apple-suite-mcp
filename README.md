@@ -92,7 +92,20 @@ cd ~/apple-suite-mcp && uv run python server.py check
   Access** in System Settings → Privacy & Security.
 - **Full Disk Access** (optional): enables the fast mail path. Without it,
   everything still works — large mailboxes are just slow (~30s per query).
-  This is a broad grant; read the code and decide for yourself.
+  This is a broad grant; read the code and decide for yourself. **Note that
+  this one takes two grants — see below.**
+
+> **Gotcha: Full Disk Access needs two entries, not one.** In System
+> Settings → Privacy & Security → Full Disk Access, enable both your host
+> app (e.g. "Claude") **and "uv"**. macOS grants this permission per
+> executable, and the server runs as a `uv`-launched subprocess with its own
+> permission identity — so granting the app alone isn't enough.
+>
+> Symptom of the missing grant: `mail_search` and `mail_messages` time out
+> while `check` keeps reporting `full_disk_access: "no access"`, no matter
+> how many times you toggle the app or restart the machine. Switching on
+> "uv" flips it to `"ok — fast mail path active"` immediately, with no
+> relaunch needed.
 
 ## Try it
 
