@@ -1179,7 +1179,14 @@ FIXES = {
     "automation": f"System Settings > Privacy & Security > Automation — allow the host app to control the target app ({PANE}?Privacy_Automation)",
     "calendars": f"System Settings > Privacy & Security > Calendars — set the host app to Full Access ({PANE}?Privacy_Calendars)",
     "reminders": f"System Settings > Privacy & Security > Reminders — set the host app to Full Access ({PANE}?Privacy_Reminders)",
-    "full_disk": f"System Settings > Privacy & Security > Full Disk Access — enable the host app ({PANE}?Privacy_AllFiles)",
+    # Two entries, not one: macOS grants Full Disk Access per executable, and
+    # this server is a uv subprocess with its own permission identity.
+    "full_disk": ("System Settings > Privacy & Security > Full Disk Access — "
+                  "enable BOTH the host app (e.g. Claude) AND 'uv'. This "
+                  "server runs as a uv-launched subprocess with its own "
+                  "permission identity, so granting the app alone leaves this "
+                  "reporting 'no access' no matter how often you restart "
+                  f"({PANE}?Privacy_AllFiles)"),
 }
 
 
